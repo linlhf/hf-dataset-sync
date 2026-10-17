@@ -463,7 +463,7 @@ class Sync:
                     previous=s['verified_bytes']; previous_time=now; last_report=now
                     if not running and not ready and set(s['states'])=={'verified'}:
                         self.backup(); log('complete',**s); return
-                    if not running and not ready and set(s['states'])<={'verified','blocked'}:
+                    if not running and not ready and 'blocked' in s['states']:
                         self.backup(); raise RuntimeError('Blocked files require review; task is incomplete')
                 if now-last_backup>=300:
                     try: self.backup(); last_backup=now

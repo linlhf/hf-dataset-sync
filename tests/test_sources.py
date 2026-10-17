@@ -26,6 +26,7 @@ class SourcesTest(unittest.TestCase):
            'objects':[{'path':'data/file','bytes':len(body),'sha256':None,'git_blob_id':None,'xet_hash':digest}]}
         cfg=json.loads((Path(__file__).resolve().parents[1]/'examples/profile.json').read_text())
         cfg.update(source_type='bucket',mode='xet',repo=m['repo'],revision=m['revision'],bucket='example-bucket',prefix='data/',durable=str(root/'durable'))
+        cfg.update(stage_limit_bytes=1024**2,disk_reserve_bytes=0,workers=2,upload_workers=1)
         (root/'manifest.json').write_text(json.dumps(m));(root/'settings.json').write_text(json.dumps(cfg))
         return cfg,m
 
@@ -99,6 +100,17 @@ class SourcesTest(unittest.TestCase):
             self.assertEqual(cfg['download_proxies'],[cfg['proxy']])
             args.revision='main'
             with self.assertRaises(ValueError):plan(args)
+
+    def test_changed_source_does_not_deadlock_pending_files_on_cache_budget(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);cfg,m=self.task(root)
+            m['objects'].append(dict(m['objects'][0],path='data/second'));m.update(files=2,bytes=6)
+            cfg.update(stage_limit_bytes=65539,disk_reserve_bytes=0,workers=1,upload_workers=1)
+            (root/'manifest.json').write_text(json.dumps(m));(root/'settings.json').write_text(json.dumps(cfg))
+            s=Sync(root);s.initialize();row=s.admit(1)[0]
+            s.failed(row,SourceChanged('drift'))
+            with self.assertRaisesRegex(RuntimeError,'Blocked files require review'):s.run()
+            self.assertEqual(s.summary()['states']['pending']['files'],1)
 
 
 if __name__=='__main__':unittest.main()
