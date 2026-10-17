@@ -6,12 +6,16 @@
 
 每档预热后至少两个 60–120 秒窗口；限流评估需要覆盖配额时间窗口。如必须重启，保留状态，排除旧缓存集中完成的突发窗口。记录配置、时间、下载净增、verified 净增、失败/限流、缓存变化、资源利用。按端到端收益选择，不只看峰值；没有稳定收益就恢复上一个明确配置。
 
-`hf_requests_per_second` 是进程内 HF Hub 请求共享节奏，不是下载 MB/s，也不是每 worker 的限额。默认 10 仅为起点；应根据响应头和同账号其它任务分配预算。当前上限 16，实际额度更低就降低；不通过节点/IP轮换绕过限流。CDN 文件体与内网 OSS 不经过 HF 请求门控。多个任务进程之间不共享全局限速器，需要分配各任务预算。
+`hf_requests_per_second` 是进程内 Python HF Hub 请求共享节奏，不是下载 MB/s，也不是每 worker 的限额。默认 10 仅为起点；应根据响应头和同账号其它任务分配预算。当前上限 16，实际额度更低就降低；不通过节点/IP轮换绕过限流。CDN 文件体、Rust Xet CAS 内部请求及内网 OSS 不经过这个 Python 门控；Xet 内部重试由官方 SDK 处理，外层仍保留有限重试及可识别的 429 冷却。多个任务进程之间不共享全局限速器，需要分配各任务预算。
 
 源请求多而字节少时，以文件/秒和剩余文件数估算 ETA；大文件阶段可用最近稳定窗口剩余字节/端到端速率。MB/s=10^6 B/s，MiB/s=2^20 B/s，Mbps=8×MB/s。verified 按整文件完成入账，短窗口可能大于下载速率；它不是网卡实时速度。缓存清理与数据库更新有时间差，统计不能直接用 cache+verified 相减，附带 status 用中间状态已下载量避免该竞态。
 
 最大单文件必须小于 staging budget；预算控制包含在途大小与磁盘安全余量，但文件系统元数据和 SDK 临时缓存仍有额外开销。不要删除未上传缓存提速；只在上传后长度/CRC通过时清理本任务的文件缓存。
 
-依赖固定 HF SDK 0.30.0，HTTP 传输 hook 和 requests adapter 与此版本耦合。Xet 不等于必然更快；本版不支持 Xet，升级/接入后需独立测试实际传输、重组、续传和限流，不能只设变量就声称开启。
+依赖固定 HF SDK 1.33.0、hf-xet 1.7.0 和 HTTPX 0.28 系列。HTTPX 路由/门控、SDK 传输 hook 与固定版本耦合，升级后重跑测试。`transport.http_calls` / `xet_calls` 记录 dataset 实际 SDK 传输调用，`bucket_xet_calls` 记录 Bucket 下载 API 调用次数（含失败尝试，不等于成功文件数）。非 Xet 的小文件可能仍走 HTTP。
 
-官方参考：[HF 限流与响应头](https://huggingface.co/docs/hub/rate-limits)、[固定版本 HfApi](https://huggingface.co/docs/huggingface_hub/v0.30.0/package_reference/hf_api)。响应头是当前运行依据，历史配额和吞吐不是保证。
+Xet 启用原生高性能模式，但不等于必然更快。Rust 自身有并行请求，外层 32/64 worker 不代表连接总数；应分档测资源和错误率，不盲目叠加并发。Xet 使用单一进程级代理入口，多节点在已有本地负载均衡器中配置，不对每个文件更改全局代理。
+
+Xet 禁用额外 chunk cache，保留当前任务文件缓存和 SDK 必需元数据；未完成文件重启可能重新重组，不保证逐字节续传。Xet 状态只计完成重组的字节，因此短窗口 0 或突增不等于链路停顿/峰值。Bucket 校验需要原生 Xet hash 和 OSS CRC 两次本地扫描，应观察磁盘吞吐。
+
+官方参考：[HF 限流与响应头](https://huggingface.co/docs/hub/rate-limits)、[Bucket API](https://huggingface.co/docs/huggingface_hub/guides/buckets)、[Xet 环境变量](https://huggingface.co/docs/huggingface_hub/package_reference/environment_variables)。响应头是当前运行依据，历史配额和吞吐不是保证。

@@ -26,34 +26,37 @@ def write_new(path,data):
 
 def plan(args):
     os.environ['HF_ENDPOINT']='https://huggingface.co'
-    from huggingface_hub import HfApi, configure_http_backend
-    from huggingface_hub.utils._http import UniqueRequestIdAdapter
-    import requests
+    from huggingface_hub import HfApi, set_client_factory
+    import httpx
     lock=threading.Lock(); deadline=[0.0]
-    class Adapter(UniqueRequestIdAdapter):
-        def send(self,request,*a,**kw):
-            with lock:
-                time.sleep(max(0,deadline[0]-time.monotonic()));deadline[0]=time.monotonic()+1
-            return super().send(request,*a,**kw)
-    def factory():
-        s=requests.Session();s.mount('https://',Adapter());return s
-    configure_http_backend(factory)
+    def pace(request):
+        with lock:
+            time.sleep(max(0,deadline[0]-time.monotonic()));deadline[0]=time.monotonic()+1
+    set_client_factory(lambda:httpx.Client(follow_redirects=True,timeout=60,event_hooks={'request':[pace]}))
     api=HfApi(endpoint='https://huggingface.co',token=os.environ.get('HF_TOKEN') or False)
-    revision=api.dataset_info(args.repo,revision=args.revision).sha
-    def scan(path):
-        return list(api.list_repo_tree(args.repo,repo_type='dataset',revision=revision,path_in_repo=path,recursive=True))
-    top=list(api.list_repo_tree(args.repo,repo_type='dataset',revision=revision))
-    files=[f for f in top if hasattr(f,'size')]
-    with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        for entries in pool.map(scan,[f.path for f in top if not hasattr(f,'size')]):
-            files.extend(f for f in entries if hasattr(f,'size'))
+    kind='bucket' if args.bucket else 'dataset';repo=args.bucket or args.repo
+    if kind=='bucket':
+        if args.revision is not None:raise ValueError('Buckets do not have Git revisions')
+        files=[f for f in api.list_bucket_tree(repo,prefix=args.prefix or None,recursive=True) if f.type=='file']
+        revision=hashlib.sha256(json.dumps(sorted((f.path,f.size,f.xet_hash) for f in files),separators=(',',':')).encode()).hexdigest()
+    else:
+        if args.prefix:raise ValueError('Use --include for repository path selection')
+        revision=api.dataset_info(repo,revision=args.revision or 'main').sha
+        def scan(path):
+            return list(api.list_repo_tree(repo,repo_type='dataset',revision=revision,path_in_repo=path,recursive=True))
+        top=list(api.list_repo_tree(repo,repo_type='dataset',revision=revision))
+        files=[f for f in top if hasattr(f,'size')]
+        with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for entries in pool.map(scan,[f.path for f in top if not hasattr(f,'size')]):
+                files.extend(f for f in entries if hasattr(f,'size'))
     objects=[];excluded=[]
     for f in sorted(files,key=lambda f:f.path):
-        row={'path':f.path,'bytes':f.size,'sha256':f.lfs.sha256 if f.lfs else None,'git_blob_id':f.blob_id}
+        row=({'path':f.path,'bytes':f.size,'sha256':None,'git_blob_id':None,'xet_hash':f.xet_hash} if kind=='bucket' else
+             {'path':f.path,'bytes':f.size,'sha256':f.lfs.sha256 if f.lfs else None,'git_blob_id':f.blob_id})
         selected=(not args.include or any(fnmatch.fnmatchcase(f.path,p) for p in args.include)) and not any(fnmatch.fnmatchcase(f.path,p) for p in args.exclude)
         (objects if selected else excluded).append(row)
-    manifest={'repo':args.repo,'revision':revision,'files':len(objects),'bytes':sum(r['bytes'] for r in objects),'objects':objects,
-              'excluded':excluded,'selection':{'include':args.include,'exclude':args.exclude},'raw_files':len(files)}
+    manifest={'source_type':kind,'repo':repo,'revision':revision,'files':len(objects),'bytes':sum(r['bytes'] for r in objects),'objects':objects,
+              'excluded':excluded,'selection':{'include':args.include,'exclude':args.exclude,'prefix':args.prefix},'raw_files':len(files),'enumerated_at':time.time()}
     validate_manifest(manifest)
     validate_manifest(dict(manifest,objects=objects+excluded,files=len(files),bytes=sum(r['bytes'] for r in objects+excluded)))
     write_new(args.output,manifest)
@@ -68,7 +71,9 @@ def init(args):
     prefix=u.path.lstrip('/').rstrip('/')+'/'
     relative_path(prefix[:-1])
     root=Path(args.task).resolve()
-    cfg.update(repo=m['repo'],revision=m['revision'],bucket=u.netloc,prefix=prefix,durable=str(root/'durable'))
+    kind=m.get('source_type','dataset');mode=getattr(args,'mode',None) or ('xet' if kind=='bucket' else cfg['mode'])
+    cfg.update(repo=m['repo'],revision=m['revision'],source_type=kind,mode=mode,bucket=u.netloc,prefix=prefix,durable=str(root/'durable'))
+    if mode=='xet':cfg['download_proxies']=[cfg['proxy']]
     validate_settings(cfg)
     if any(r['bytes']+65536>cfg['stage_limit_bytes'] for r in m['objects']): raise ValueError('File exceeds staging budget')
     root.mkdir(mode=0o700,parents=True,exist_ok=False)
@@ -82,13 +87,16 @@ def sample(root):
         states={s:{'files':n,'bytes':b} for s,n,b in db.execute('SELECT status,count(*),sum(size) FROM files GROUP BY status')}
         partials=db.execute("SELECT path,size FROM files WHERE reserved=1 AND status NOT IN ('verified','checking','ready','uploading')").fetchall()
     downloaded=sum(states.get(s,{}).get('bytes',0) for s in ('verified','checking','ready','uploading'))
-    for path,size in partials:
+    mode=read(root/'settings.json')['mode']
+    # Xet can preallocate full-size files: count completed reconstructions only.
+    for path,size in partials if mode=='http' else []:
         n=0
         for p in (root/'cache'/hashlib.sha256(path.encode()).hexdigest()).glob('datasets--*/blobs/*'):
             try: n+=p.stat().st_size if p.is_file() else 0
             except FileNotFoundError: pass
         downloaded+=min(n,size)
-    return {'time':time.time(),'states':states,'downloaded_bytes':downloaded,'verified_bytes':states.get('verified',{}).get('bytes',0)}
+    return {'time':time.time(),'states':states,'downloaded_bytes':downloaded,'verified_bytes':states.get('verified',{}).get('bytes',0),
+            'download_metric':'completed_reconstruction_bytes' if mode=='xet' else 'effective_download_progress'}
 
 
 def status(args):
@@ -104,8 +112,9 @@ def status(args):
 
 
 def reconcile(m,db_rows,objects,prefix):
-    expected={r['path']:(r['bytes'],r.get('sha256'),r.get('git_blob_id')) for r in m['objects']}
-    db={r[0]:tuple(r[1:4]) for r in db_rows}
+    bucket=m.get('source_type')=='bucket'
+    expected={r['path']:(r['bytes'],r.get('sha256'),r.get('git_blob_id'))+((r['xet_hash'],) if bucket else ()) for r in m['objects']}
+    db={r[0]:tuple(r[1:5] if bucket else r[1:4]) for r in db_rows}
     missing_db=sorted(expected.keys()-db.keys());extra_db=sorted(db.keys()-expected.keys())
     changed=[p for p in expected.keys()&db.keys() if expected[p]!=db[p]]
     seen=set();wrong=[];extra=0
@@ -128,7 +137,8 @@ def verify(args):
     with sqlite3.connect('file:'+str(root/'state.sqlite3')+'?mode=ro',uri=True) as db:
         saved=db.execute("SELECT value FROM metadata WHERE key='task_identity'").fetchone()
         if not saved or saved[0]!=task_identity(cfg,m):raise ValueError('Task identity mismatch')
-        rows=db.execute('SELECT path,size,sha256,git_blob_id FROM files').fetchall()
+        columns='path,size,sha256,git_blob_id'+(',xet_hash' if m.get('source_type')=='bucket' else '')
+        rows=db.execute('SELECT '+columns+' FROM files').fetchall()
         remaining=db.execute("SELECT count(*) FROM files WHERE status!='verified'").fetchone()[0]
     session=oss2.Session();session.session.trust_env=False
     b=oss2.Bucket(oss2.Auth(os.environ['OSS_ACCESS_KEY_ID'],os.environ['OSS_ACCESS_KEY_SECRET']),cfg['endpoint'],cfg['bucket'],session=session)
@@ -139,9 +149,11 @@ def verify(args):
 
 def main():
     p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='command',required=True)
-    q=sub.add_parser('plan');q.add_argument('--repo',required=True);q.add_argument('--revision',default='main');q.add_argument('--output',required=True)
+    q=sub.add_parser('plan');g=q.add_mutually_exclusive_group(required=True);g.add_argument('--repo');g.add_argument('--bucket')
+    q.add_argument('--revision');q.add_argument('--prefix',default='');q.add_argument('--output',required=True)
     q.add_argument('--workers',type=int,choices=range(1,9),default=4);q.add_argument('--include',action='append',default=[]);q.add_argument('--exclude',action='append',default=[])
     q=sub.add_parser('init');q.add_argument('--manifest',required=True);q.add_argument('--profile',required=True);q.add_argument('--destination',required=True);q.add_argument('--task',required=True)
+    q.add_argument('--mode',choices=['http','xet'])
     for name in ('status','verify'):
         q=sub.add_parser(name);q.add_argument('--task',required=True)
         if name=='status':q.add_argument('--seconds',type=int,choices=range(0,121),default=0)

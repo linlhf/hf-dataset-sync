@@ -27,7 +27,7 @@ class TaskTest(unittest.TestCase):
 
     def test_settings_and_identity(self):
         validate_settings(self.cfg)
-        for key,value in [('endpoint','https://oss-cn-beijing.aliyuncs.com'),('prefix','/'),('mode','xet'),('workers',0),('download_proxies',['http://user:secret@127.0.0.1:8080'])]:
+        for key,value in [('endpoint','https://oss-cn-beijing.aliyuncs.com'),('prefix','/'),('mode','invalid'),('workers',0),('download_proxies',['http://user:secret@127.0.0.1:8080'])]:
             cfg=dict(self.cfg);cfg[key]=value
             with self.assertRaises(ValueError):validate_settings(cfg)
         a=task_identity(self.cfg,self.manifest)

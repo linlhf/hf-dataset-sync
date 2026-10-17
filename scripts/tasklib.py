@@ -14,8 +14,10 @@ def relative_path(value):
 
 
 def validate_manifest(m):
-    if not re.fullmatch(r'[\w.-]+/[\w.-]+',m['repo']) or not re.fullmatch(r'[a-f0-9]{40}',m['revision']):
-        raise ValueError('Expected dataset repo ID and pinned commit SHA')
+    kind=m.get('source_type','dataset')
+    if kind not in ('dataset','bucket'): raise ValueError('Unknown source type')
+    if not re.fullmatch(r'[\w.-]+/[\w.-]+',m['repo']) or not re.fullmatch(r'[a-f0-9]{%d}'%(64 if kind=='bucket' else 40),m['revision']):
+        raise ValueError('Expected source ID and pinned commit or bucket inventory digest')
     seen=set()
     for row in m['objects']:
         path=relative_path(row['path'])
@@ -23,7 +25,9 @@ def validate_manifest(m):
         seen.add(path)
         if type(row['bytes']) is not int or row['bytes']<0: raise ValueError('Invalid size')
         sha=row.get('sha256'); git=row.get('git_blob_id')
-        if not ((sha and re.fullmatch(r'[a-f0-9]{64}',sha)) or (not sha and git and re.fullmatch(r'[a-f0-9]{40}',git))):
+        if kind=='bucket':
+            if sha or git or not re.fullmatch(r'[a-f0-9]{64}',row.get('xet_hash','')):raise ValueError('Bucket requires Xet hash, not SHA/Git digest')
+        elif not ((sha and re.fullmatch(r'[a-f0-9]{64}',sha)) or (not sha and git and re.fullmatch(r'[a-f0-9]{40}',git))):
             raise ValueError('Missing or invalid source digest')
     if not seen or len(seen)!=m['files'] or sum(r['bytes'] for r in m['objects'])!=m['bytes']:
         raise ValueError('Manifest totals mismatch or empty selection')
@@ -37,7 +41,8 @@ def validate_settings(cfg):
     prefix=cfg['prefix']
     if not prefix.endswith('/'): raise ValueError('Require a dedicated nonempty prefix ending in /')
     relative_path(prefix[:-1])
-    if cfg['mode']!='http': raise ValueError('This release supports official HF HTTP downloads only')
+    if cfg['mode'] not in ('http','xet'): raise ValueError('Expected http or xet mode')
+    if cfg.get('source_type','dataset')=='bucket' and cfg['mode']!='xet':raise ValueError('Bucket downloads require Xet')
     for key,limit in [('workers',64),('upload_workers',32),('upload_part_threads',8),('max_attempts',100)]:
         value=cfg.get(key,{'upload_part_threads':2,'max_attempts':12}.get(key))
         if type(value) is not int or not 1<=value<=limit: raise ValueError('Invalid '+key)
@@ -47,6 +52,7 @@ def validate_settings(cfg):
     if not Path(cfg['durable']).is_absolute(): raise ValueError('Durable directory must be absolute')
     proxies=cfg.get('download_proxies',[cfg['proxy']])
     if not proxies or len(proxies)!=len(set(proxies)): raise ValueError('Invalid proxy list')
+    if cfg['mode']=='xet' and proxies!=[cfg['proxy']]:raise ValueError('Xet uses one process-wide proxy; use a local load balancer')
     for proxy in [cfg['proxy'],*proxies]:
         if proxy=='': continue
         u=urlsplit(proxy)
@@ -57,4 +63,9 @@ def validate_settings(cfg):
 def task_identity(cfg,m):
     rows=sorted((r['path'],r['bytes'],r.get('sha256'),r.get('git_blob_id')) for r in m['objects'])
     data=[m['repo'],m['revision'],cfg['endpoint'],cfg['bucket'],cfg['prefix'],rows]
+    if m.get('source_type')=='bucket':data+=['bucket',sorted((r['path'],r['xet_hash']) for r in m['objects'])]
     return hashlib.sha256(json.dumps(data,separators=(',',':')).encode()).hexdigest()
+
+
+def source_digest(row):
+    return 'xet:'+row['xet_hash'] if row.get('xet_hash') else row['sha256'] or row['git_blob_id']

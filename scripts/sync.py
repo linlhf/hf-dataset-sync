@@ -17,11 +17,11 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
-from urllib.parse import urlsplit
 
 import oss2
 import requests
-from tasklib import validate_settings, validate_manifest, task_identity
+import httpx
+from tasklib import validate_settings, validate_manifest, task_identity, source_digest
 
 if not __debug__:
     raise RuntimeError('Python -O disables integrity assertions and is unsupported')
@@ -32,6 +32,10 @@ class IntegrityError(Exception):
 
 
 class DestinationConflict(Exception):
+    pass
+
+
+class SourceChanged(Exception):
     pass
 
 
@@ -77,8 +81,16 @@ def fingerprint(stream, size, sha256=None, git_blob_id=None):
     return str(crc.crc)
 
 
-def fingerprint_file(name, size, sha256, git_blob_id):
+def fingerprint_file(name, size, sha256, git_blob_id, xet_hash=None):
     # Native crcmod holds the GIL; isolate full-file scans from network threads.
+    if xet_hash:
+        from hf_xet import hash_files
+        info=hash_files([str(name)])[0]
+        if info.hash!=xet_hash or info.file_size!=size:raise IntegrityError('Xet source hash or length mismatch')
+        crc=oss2.utils.Crc64()
+        with open(name,'rb') as src:
+            for data in iter(lambda:src.read(8*1024**2),b''):crc.update(data)
+        return str(crc.crc)
     with open(name,'rb') as src:
         return fingerprint(src,size,sha256,git_blob_id)
 
@@ -128,23 +140,23 @@ class Sync:
         self.rate_limit_until=0
         os.environ.update(HF_ENDPOINT='https://huggingface.co',HF_TOKEN=self.secret['hf_token'],
           HTTPS_PROXY=self.cfg['proxy'],HTTP_PROXY=self.cfg['proxy'],
+          https_proxy=self.cfg['proxy'],http_proxy=self.cfg['proxy'],NO_PROXY='',no_proxy='',
           HF_HOME=str(self.root/'hf-home'),HF_XET_CACHE=str(self.root/'xet-cache'),
-          HF_XET_HIGH_PERFORMANCE='1',HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_PROGRESS_BARS='1',
+          HF_XET_HIGH_PERFORMANCE='1',HF_XET_CHUNK_CACHE_SIZE_BYTES='0',HF_HUB_DISABLE_TELEMETRY='1',HF_HUB_DISABLE_PROGRESS_BARS='1',
           HF_HUB_DOWNLOAD_TIMEOUT='60',HF_HUB_ETAG_TIMEOUT='30',
           HF_HUB_DISABLE_XET='1' if self.cfg['mode']=='http' else '0')
         for key in ('ALL_PROXY','all_proxy'): os.environ.pop(key,None)
         logging.disable(logging.CRITICAL)
-        from huggingface_hub import hf_hub_download
+        from huggingface_hub import hf_hub_download, constants
         import huggingface_hub.file_download as download
-        # HF 0.30 ignores HF_HUB_DISABLE_XET; select its official HTTP fallback explicitly.
-        if self.cfg['mode']=='http': download.is_xet_available=lambda:False
+        constants.HF_HUB_DISABLE_XET=self.cfg['mode']=='http'
         self.transport_lock=threading.Lock()
         proxies=self.cfg.get('download_proxies',[self.cfg['proxy']])
         assert len(proxies)==1 or self.cfg['mode']=='http'
         self.proxy_load=dict.fromkeys(proxies,0)
         self.transport={'http_calls':0,'xet_calls':0,'resumed_http_calls':0,'resumed_bytes':0}
         for method,metric in [('http_get','http_calls'),('xet_get','xet_calls')]:
-            original=getattr(download,method)
+            original=getattr(getattr(download,method),'_untracked',getattr(download,method))
             def tracked(*args,_original=original,_metric=metric,**kwargs):
                 with self.transport_lock:
                     self.transport[_metric]+=1
@@ -152,8 +164,13 @@ class Sync:
                         self.transport['resumed_http_calls']+=1
                         self.transport['resumed_bytes']+=kwargs['resume_size']
                 return _original(*args,**kwargs)
+            tracked._untracked=original
             setattr(download,method,tracked)
-        self.hf_download=hf_hub_download
+        def routed_download(*args,proxies,**kwargs):
+            self.thread.proxy=proxies['https']
+            try:return hf_hub_download(*args,endpoint='https://huggingface.co',**kwargs)
+            finally:self.thread.proxy=self.cfg['proxy']
+        self.hf_download=routed_download
         self.hf_request_lock=threading.Lock(); self.hf_next_request=0; self.hf_request_count=0
         rate=self.cfg.get('hf_requests_per_second',0)
         assert rate==0 or 0<rate<=16
@@ -170,25 +187,26 @@ class Sync:
             self.hf_request_count+=1
 
     def configure_hf_pacing(self):
-        from huggingface_hub import configure_http_backend
-        from huggingface_hub.utils._http import UniqueRequestIdAdapter
+        from huggingface_hub import set_client_factory
         owner=self
-        class PacedAdapter(UniqueRequestIdAdapter):
-            def send(self,request,*args,**kwargs):
-                is_hub=urlsplit(request.url).hostname=='huggingface.co'
+        class RoutedTransport(httpx.BaseTransport):
+            def __init__(self):
+                self.routes={p:httpx.HTTPTransport(proxy=p or None,trust_env=False) for p in {owner.cfg['proxy'],*owner.proxy_load}}
+            def handle_request(self,request):
+                is_hub=request.url.host=='huggingface.co'
                 if is_hub: owner.wait_hf_request()
-                response=super().send(request,*args,**kwargs)
+                proxy=getattr(owner.thread,'proxy',owner.cfg['proxy'])
+                response=self.routes[proxy].handle_request(request)
                 if is_hub and response.status_code==429:
                     # Stop already-queued requests immediately; failed() persists the cooldown.
                     with owner.transport_lock:
                         owner.rate_limit_until=max(owner.rate_limit_until,time.time()+rate_limit_delay(response.headers))
                 return response
+            def close(self):
+                for route in self.routes.values():route.close()
         def factory():
-            session=requests.Session()
-            session.trust_env=False
-            session.mount('https://',PacedAdapter());session.mount('http://',PacedAdapter())
-            return session
-        configure_http_backend(factory)
+            return httpx.Client(transport=RoutedTransport(),follow_redirects=True,trust_env=False,timeout=60)
+        set_client_factory(factory)
 
     def connect(self):
         c=sqlite3.connect(self.db,timeout=60); c.row_factory=sqlite3.Row
@@ -198,6 +216,7 @@ class Sync:
     def initialize(self):
         m=json.loads((self.root/'manifest.json').read_text())
         validate_manifest(m)
+        if m.get('source_type','dataset')!=self.cfg.get('source_type','dataset'):raise ValueError('Source type mismatch')
         assert m['repo']==self.cfg['repo'] and m['revision']==self.cfg['revision']
         assert len(m['objects'])==m['files'] and sum(f['bytes'] for f in m['objects'])==m['bytes']
         with closing(self.connect()) as c:
@@ -210,6 +229,8 @@ class Sync:
               updated REAL NOT NULL DEFAULT 0);
               CREATE INDEX IF NOT EXISTS work ON files(status,next_retry);
               CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT);''')
+            if 'xet_hash' not in [r[1] for r in c.execute('PRAGMA table_info(files)')]:
+                c.execute('ALTER TABLE files ADD COLUMN xet_hash TEXT')
             old=c.execute("SELECT value FROM metadata WHERE key='revision'").fetchone()
             assert old is None or old[0]==m['revision'],'State belongs to another snapshot'
             identity=task_identity(self.cfg,m)
@@ -222,10 +243,10 @@ class Sync:
                 for f in m['objects']:
                     p=PurePosixPath(f['path'])
                     assert not p.is_absolute() and '..' not in p.parts and '\0' not in f['path']
-                    assert f['bytes']>=0 and (f['sha256'] or f['git_blob_id'])
+                    assert f['bytes']>=0 and (f['sha256'] or f['git_blob_id'] or f.get('xet_hash'))
                     assert f['bytes']+65536<=self.cfg['stage_limit_bytes']
-                    rows.append((f['path'],f['bytes'],f['sha256'],f['git_blob_id']))
-                c.executemany('INSERT INTO files(path,size,sha256,git_blob_id) VALUES(?,?,?,?)',rows)
+                    rows.append((f['path'],f['bytes'],f['sha256'],f['git_blob_id'],f.get('xet_hash')))
+                c.executemany('INSERT INTO files(path,size,sha256,git_blob_id,xet_hash) VALUES(?,?,?,?,?)',rows)
                 c.execute("INSERT INTO metadata VALUES('revision',?)",(m['revision'],))
                 c.execute("INSERT INTO metadata VALUES('total_bytes',?)",(str(m['bytes']),))
             c.execute("UPDATE files SET status='retry',next_retry=0,error='interrupted; resume cached data' WHERE status IN ('downloading','checking','ready','uploading')")
@@ -263,11 +284,12 @@ class Sync:
         try: head=b.head_object(key)
         except oss2.exceptions.NoSuchKey: return False
         if head.content_length!=row['size']: raise DestinationConflict('existing size differs')
-        expected=row['sha256'] or row['git_blob_id']
+        expected=source_digest(row)
         meta=head.headers
         crc=meta.get('x-oss-hash-crc64ecma')
         if meta.get('x-oss-meta-hf-digest')==expected and crc is not None and meta.get('x-oss-meta-source-crc64')==crc:
             return True
+        if row.get('xet_hash'):raise DestinationConflict('Existing object lacks matching Xet/CRC provenance')
         obj=b.get_object(key)
         try: actual=fingerprint(obj,row['size'],row['sha256'],row['git_blob_id'])
         except IntegrityError as e: raise DestinationConflict('existing object digest differs') from e
@@ -286,13 +308,24 @@ class Sync:
         usable=(cached and cached.is_file() and cached.resolve().is_relative_to(self.cache_dir(path).resolve())
                 and cached.stat().st_size==row['size'] and cached.stat().st_mtime_ns==row['cache_mtime'] and row['crc64'])
         if usable: return str(cached),row['crc64']
+        if self.cfg.get('source_type')=='bucket':
+            from huggingface_hub import HfApi
+            api=HfApi(endpoint='https://huggingface.co',token=self.secret['hf_token'])
+            infos=list(api.get_bucket_paths_info(self.cfg['repo'],[path]))
+            if len(infos)!=1 or infos[0].xet_hash!=row['xet_hash'] or infos[0].size!=row['size']:
+                raise SourceChanged('Bucket object missing or changed since inventory')
+            directory=self.cache_dir(path);directory.mkdir(parents=True,exist_ok=True)
+            name=directory/'bucket-content'
+            with self.transport_lock:self.transport['bucket_xet_calls']=self.transport.get('bucket_xet_calls',0)+1
+            api.download_bucket_files(self.cfg['repo'],[(infos[0],name)],raise_on_missing_files=True)
+            self.update(path,status='checking');return str(name),None
         with self.transport_lock:
             proxy=min(self.proxy_load,key=self.proxy_load.get); self.proxy_load[proxy]+=row['size']
         try:
             kwargs=dict(repo_type='dataset',revision=self.cfg['revision'],token=self.secret['hf_token'],cache_dir=self.cache_dir(path))
             try:
                 name=Path(self.hf_download(self.cfg['repo'],path,proxies={'http':proxy,'https':proxy},**kwargs))
-            except (OSError,requests.RequestException) as e:
+            except (OSError,requests.RequestException,httpx.HTTPError) as e:
                 # Keep the shared proxy's failover on network errors; never retry auth/HTTP or disk errors here.
                 if proxy==self.cfg['proxy'] or http_failure(e)[0] is not None or getattr(e,'errno',None) is not None: raise
                 log('download_proxy_fallback',error_type=type(e).__name__)
@@ -307,7 +340,7 @@ class Sync:
     def upload(self,row,name,crc):
         path=row['path']; key=self.cfg['prefix']+path; b=self.bucket()
         self.update(path,status='uploading')
-        headers={'x-oss-forbid-overwrite':'true','x-oss-meta-hf-digest':row['sha256'] or row['git_blob_id'],
+        headers={'x-oss-forbid-overwrite':'true','x-oss-meta-hf-digest':source_digest(row),
                  'x-oss-meta-hf-revision':self.cfg['revision'],'x-oss-meta-source-crc64':str(crc)}
         oss2.resumable_upload(b,key,name,headers=headers,
             store=oss2.ResumableStore(root=str(self.durable),dir='oss-checkpoints'),
@@ -332,7 +365,7 @@ class Sync:
         if isinstance(e,IntegrityError) or (isinstance(e,UploadFailure) and kind=='IntegrityError'):
             self.cleanup(path)
             self.update(path,cached_file=None,cache_mtime=None,crc64=None)
-        blocked=isinstance(e,DestinationConflict) or (isinstance(e,UploadFailure) and kind=='DestinationConflict') or code in [401,403] or row['attempts']>=getattr(self,'cfg',{}).get('max_attempts',12)
+        blocked=isinstance(e,(DestinationConflict,SourceChanged)) or (isinstance(e,UploadFailure) and kind=='DestinationConflict') or code in [401,403] or row['attempts']>=getattr(self,'cfg',{}).get('max_attempts',12)
         self.update(path,status='blocked' if blocked else 'retry',error=err,
                     next_retry=max(time.time()+retry_delay(row['attempts']),self.rate_limit_until if code==429 else 0))
         log('blocked' if blocked else 'retry',path=path,error_type=kind,http_status=code)
@@ -393,7 +426,7 @@ class Sync:
                             if stage=='download':
                                 name,crc=result
                                 if crc is None:
-                                    future=checks.submit(fingerprint_file,name,row['size'],row['sha256'],row['git_blob_id'])
+                                    future=checks.submit(fingerprint_file,name,row['size'],row['sha256'],row['git_blob_id'],row.get('xet_hash'))
                                     running[future]=('check',row,name); continue
                             else: crc=result
                             self.update(row['path'],status='ready',cached_file=name,cache_mtime=Path(name).stat().st_mtime_ns,crc64=crc)

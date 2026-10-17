@@ -1,10 +1,12 @@
 [project]
 name = "hf-dataset-sync-skill"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reusable Codex skill and resumable official HF to internal OSS pipeline"
 requires-python = ">=3.11,<3.14"
 dependencies = [
-  "huggingface-hub==0.30.0",
+  "huggingface-hub==1.33.0",
+  "hf-xet==1.7.0",
+  "httpx>=0.28,<0.29",
   "oss2==2.19.1",
   "requests==2.32.5",
 ]

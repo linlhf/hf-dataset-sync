@@ -54,19 +54,38 @@ class SyncTest(unittest.TestCase):
             s.rate_limit_until=103;s.wait_hf_request();self.assertEqual(clock[0],103)
 
     def test_hf_adapter_pauses_on_429_but_not_cdn_or_oss(self):
-        import requests
-        from huggingface_hub import configure_http_backend,get_session
-        from huggingface_hub.utils._http import UniqueRequestIdAdapter
+        import httpx
+        from huggingface_hub import set_client_factory,get_session
         s=Sync.__new__(Sync);s.transport_lock=threading.Lock();s.rate_limit_until=0;calls=[]
+        s.cfg={'proxy':''};s.proxy_load={'':0};s.thread=threading.local()
         s.wait_hf_request=lambda:calls.append('request')
         s.configure_hf_pacing()
-        response=requests.Response();response.status_code=429;response.headers['Retry-After']='5'
         try:
-            with patch.object(UniqueRequestIdAdapter,'send',return_value=response),patch('sync.time.time',return_value=100):
+            with patch.object(httpx.HTTPTransport,'handle_request',side_effect=lambda req:httpx.Response(429,headers={'Retry-After':'5'})),patch('sync.time.time',return_value=100):
                 for url in ['https://huggingface.co/a','https://us.aws.cdn.hf.co/b','https://example-bucket.oss-cn-wulanchabu-internal.aliyuncs.com/c']:
-                    get_session().get_adapter(url).send(requests.Request('HEAD',url).prepare())
+                    get_session().get(url)
             self.assertEqual(len(calls),1);self.assertEqual(s.rate_limit_until,107)
-        finally:configure_http_backend()
+        finally:set_client_factory(lambda:httpx.Client())
+
+    def test_httpx_routes_each_thread_without_environment_proxy(self):
+        import httpx
+        from huggingface_hub import set_client_factory,get_session
+        s=Sync.__new__(Sync);s.cfg={'proxy':''};s.proxy_load={'http://127.0.0.1:1082':0}
+        s.thread=threading.local();s.wait_hf_request=lambda:None
+        calls=[]
+        def route(*,proxy,trust_env):
+            self.assertFalse(trust_env)
+            def request(req):
+                calls.append(proxy);return httpx.Response(200)
+            return httpx.MockTransport(request)
+        with patch('sync.httpx.HTTPTransport',side_effect=route):
+            s.configure_hf_pacing()
+            try:
+                client=get_session();client.get('https://huggingface.co/file')
+                s.thread.proxy='http://127.0.0.1:1082'
+                client.get('https://cas-bridge.xethub.hf.co/file')
+                self.assertEqual(calls,[None,s.thread.proxy])
+            finally:set_client_factory(lambda:httpx.Client())
 
     def test_largest_resource_first_keeps_small_files_in_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,7 +286,10 @@ class SyncTest(unittest.TestCase):
             self.assertEqual(downloads,[first[0]['path']])
             self.assertEqual(s.summary()['verified_files'],1)
             self.assertFalse(s.cache_dir(first[0]['path']).exists())
+            # A 0.1 task has the same identity but lacks the nullable Xet column.
+            with s.connect() as db:db.execute('ALTER TABLE files DROP COLUMN xet_hash')
             s.initialize()
+            self.assertEqual(s.summary()['verified_files'],1)
             self.assertEqual(s.summary()['states']['retry']['files'],1)
             self.assertEqual(s.admit(1)[0]['path'],first[1]['path'])
             self.assertTrue((root/'durable/state.sqlite3').exists())
