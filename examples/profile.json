@@ -1,0 +1,15 @@
+{
+  "endpoint": "https://oss-cn-beijing-internal.aliyuncs.com",
+  "mode": "http",
+  "workers": 32,
+  "upload_workers": 6,
+  "upload_part_threads": 2,
+  "upload_processes": true,
+  "proxy": "",
+  "download_proxies": [""],
+  "hf_requests_per_second": 10,
+  "resource_largest_first": true,
+  "stage_limit_bytes": 171798691840,
+  "disk_reserve_bytes": 34359738368,
+  "max_attempts": 12
+}

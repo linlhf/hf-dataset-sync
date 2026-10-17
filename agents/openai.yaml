@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hugging Face 数据集同步"
+  short_description: "官方 HF 清单、断点下载、并发校验与 OSS 内网上传及完整性对账"
+  default_prompt: "使用 $hf-dataset-sync 将指定 HF 数据集同步到 OSS，先核验环境、列出清单和容量，再按授权启动并报告进度。"

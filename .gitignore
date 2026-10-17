@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.env.*
+secrets*.json
+*.pem
+*.key
+*.sqlite*
+*.log
+tasks/
+private/
+cache/
+hf-home/
+xet-cache/
